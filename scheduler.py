@@ -46,26 +46,6 @@ async def broadcast(bot, chat_ids, text: str, **kwargs) -> tuple[int, int]:
     return sent, failed
 
 
-async def _send_match_notification(match_id: int, bot) -> None:
-    async with async_session_factory() as session:
-        result = await session.execute(select(Match).where(Match.id == match_id))
-        match = result.scalar_one_or_none()
-        if not match or match.is_closed:
-            return
-
-        users_result = await session.execute(select(User))
-        users = users_result.scalars().all()
-
-        text = (
-            f"Новый прогноз!\n\n"
-            f"Матч: <b>{html.escape(match.team_a)} — {html.escape(match.team_b)}</b>\n"
-            f"Время: {match.match_time.strftime('%d.%m.%Y %H:%M')} МСК\n\n"
-            f"Выбери свой вариант:"
-        )
-        kb = get_prediction_keyboard(match)
-        await broadcast(bot, (u.tg_id for u in users), text, reply_markup=kb, parse_mode="HTML")
-
-
 async def _send_reminder(match_id: int, bot) -> None:
     async with async_session_factory() as session:
         result = await session.execute(select(Match).where(Match.id == match_id))
@@ -100,19 +80,8 @@ async def _auto_close_match(match_id: int) -> None:
 
 
 def schedule_match_notifications(match: Match, bot) -> None:
-    notify_time = match.match_time - timedelta(hours=1)
     reminder_time = match.match_time - timedelta(minutes=30)
     now = moscow_now()
-
-    if notify_time > now:
-        scheduler.add_job(
-            _send_match_notification,
-            "date",
-            run_date=notify_time,
-            args=[match.id, bot],
-            id=f"match_notify_{match.id}",
-            replace_existing=True,
-        )
 
     if reminder_time > now:
         scheduler.add_job(

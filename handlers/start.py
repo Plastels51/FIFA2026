@@ -20,6 +20,7 @@ def get_join_keyboard() -> InlineKeyboardMarkup:
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Сделать прогноз", callback_data="predict_menu")],
         [InlineKeyboardButton(text="🏆 Мой рейтинг", callback_data="rating")],
         [InlineKeyboardButton(text="🔗 Реферальная ссылка", callback_data="referral")],
     ])
@@ -27,7 +28,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
 router = Router()
 
 WELCOME_TEXT = (
-    "<b>Прогнозист ЧМ 2026</b>!\n\n"
+    "<b>Прогнозист ЧМ 2026</b>\n\n"
    "• Каждый день ты получаешь 2 задания — прогнозы на матчи\n"
     "• За правильный прогноз — <b>+1 балл</b>\n"
     "• За приглашённого друга — <b>+2 балла</b>\n"
@@ -80,8 +81,17 @@ async def cmd_start(message: Message, session: AsyncSession) -> None:
 @router.callback_query(F.data == "join")
 async def cb_join(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "Отлично! Ты в игре. Ожидай первое задание!\n\n"
+        "Отлично! Ты в игре. Сделай первый прогноз!\n\n"
         "Используй меню ниже:",
+        reply_markup=get_main_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_menu")
+async def cb_back_to_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "Главное меню:",
         reply_markup=get_main_menu_keyboard(),
     )
     await callback.answer()
