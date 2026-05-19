@@ -1,0 +1,24 @@
+# Все текстовые файлы — LF в репозитории, автоконвертация на Windows
+* text=auto eol=lf
+
+# Python — явно LF
+*.py text eol=lf
+
+# Конфиги — явно LF
+*.txt text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+.env.example text eol=lf
+
+# Бинарные файлы — без конвертации
+*.db binary
+*.db-shm binary
+*.db-wal binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
