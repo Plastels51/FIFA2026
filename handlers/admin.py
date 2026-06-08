@@ -17,7 +17,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -281,17 +281,95 @@ async def cb_list_users(callback: CallbackQuery, session: AsyncSession) -> None:
                 + (" ✅" if p.is_correct else " ❌" if p.is_correct is False else "")
                 for p, m in rows
             )
-            spoiler = f"<tg-spoiler>Прогнозы ({len(rows)}):\n{pred_lines}</tg-spoiler>"
+            spoiler = f"Прогнозы ({len(rows)}):\n{pred_lines}"
         else:
-            spoiler = "<tg-spoiler>Прогнозов нет</tg-spoiler>"
+            spoiler = "Прогнозов нет"
 
         text = (
             f"<b>{name}</b>{username_str}\n"
             f"Баллы: {u.points} | ID: {u.tg_id}\n"
             f"{spoiler}"
         )
-        await callback.message.answer(text, parse_mode="HTML")
+        del_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin:delete_user:{u.id}")
+        ]])
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=del_kb)
 
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:delete_user:"))
+async def cb_delete_user(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    user_id = int(callback.data.split(":")[2])
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    name = html.escape(user.full_name or user.username or str(user.tg_id))
+    await callback.message.edit_text(
+        f"⚠️ Удалить пользователя <b>{name}</b> (ID: {user.tg_id})?\n"
+        f"Все его прогнозы будут удалены, баллы за приглашение — у тех, кого он привёл, останутся.",
+        parse_mode="HTML",
+        reply_markup=_confirm_keyboard(
+            yes_data=f"admin:confirm_delete_user:{user_id}",
+            cancel_data=f"admin:cancel_delete_user:{user_id}",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:confirm_delete_user:"))
+async def cb_confirm_delete_user(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    user_id = int(callback.data.split(":")[2])
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    name = html.escape(user.full_name or user.username or str(user.tg_id))
+    tg_id = user.tg_id
+
+    # Отвязываем приглашённых, чтобы не нарушить внешний ключ
+    await session.execute(
+        update(User).where(User.referred_by == user_id).values(referred_by=None)
+    )
+    await session.execute(delete(Prediction).where(Prediction.user_id == user_id))
+    await session.delete(user)
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"🗑 Пользователь <b>{name}</b> (ID: {tg_id}) удалён.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:cancel_delete_user:"))
+async def cb_cancel_delete_user(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    user_id = int(callback.data.split(":")[2])
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await callback.message.edit_text("Пользователь уже удалён.")
+        await callback.answer()
+        return
+    name = html.escape(user.full_name or user.username or str(user.tg_id))
+    del_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin:delete_user:{user.id}")
+    ]])
+    await callback.message.edit_text(
+        f"<b>{name}</b>\nБаллы: {user.points} | ID: {user.tg_id}",
+        parse_mode="HTML",
+        reply_markup=del_kb,
+    )
     await callback.answer()
 
 
