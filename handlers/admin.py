@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import ADMIN_IDS, moscow_now
+from config import ADMIN_IDS, CHANNEL_ID, moscow_now
 from database.models import Match, Prediction, User
 from handlers.predictions import get_prediction_keyboard
 from scheduler import SEND_DELAY, broadcast, safe_send
@@ -34,6 +34,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📋 Список матчей", callback_data="admin:list_matches")],
         [InlineKeyboardButton(text="👥 Пользователи и прогнозы", callback_data="admin:list_users")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast")],
+        [InlineKeyboardButton(text="🏁 Итоги", callback_data="admin:results")],
         [InlineKeyboardButton(text="📊 Экспорт рейтинга", callback_data="admin:export_rating")],
     ])
 
@@ -597,6 +598,49 @@ async def fsm_broadcast(message: Message, state: FSMContext, session: AsyncSessi
 
     sent, failed = await broadcast(user_bot, [u.tg_id for u in users], text)
     await message.answer(f"Рассылка завершена. Отправлено: {sent}, ошибок: {failed}.")
+
+
+async def _is_subscribed(user_bot: Bot, tg_id: int) -> bool | None:
+    """True — подписан, False — нет, None — проверить не удалось."""
+    if CHANNEL_ID is None:
+        return None
+    try:
+        member = await user_bot.get_chat_member(CHANNEL_ID, tg_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+@router.callback_query(F.data == "admin:results")
+async def cb_results(callback: CallbackQuery, session: AsyncSession, user_bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+
+    result = await session.execute(
+        select(User).order_by(User.points.desc()).limit(10)
+    )
+    users = result.scalars().all()
+
+    if not users:
+        await callback.answer("Пользователей нет.", show_alert=True)
+        return
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["🏁 <b>Итоги — топ-10</b>\n"]
+    for i, u in enumerate(users, start=1):
+        place = medals.get(i, f"{i}.")
+        name = html.escape(u.full_name or u.username or str(u.tg_id))
+        sub = await _is_subscribed(user_bot, u.tg_id)
+        mark = "✅" if sub else ("❌" if sub is False else "❔")
+        lines.append(f"{place} {name} — <b>{u.points}</b> очк. {mark}")
+
+    if CHANNEL_ID is None:
+        lines.append("\n⚠️ CHANNEL_ID не задан — статус подписки не проверяется.")
+    else:
+        lines.append("\n✅ — подписан, ❌ — нет, ❔ — не удалось проверить")
+
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin:export_rating")
