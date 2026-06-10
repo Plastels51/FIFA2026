@@ -10,7 +10,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import CHANNEL_ID, CHANNEL_URL
 from database.models import User
+
+
+async def _check_subscription(bot, tg_id: int) -> bool | None:
+    """True — подписан, False — точно не подписан, None — проверить нельзя."""
+    if CHANNEL_ID is None:
+        return None
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, tg_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return None
 
 
 def get_join_keyboard() -> InlineKeyboardMarkup:
@@ -22,6 +34,13 @@ def get_join_keyboard() -> InlineKeyboardMarkup:
 def get_accept_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принимаю", callback_data="accept_rules")]
+    ])
+
+
+def get_check_subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="accept_rules")],
     ])
 
 
@@ -115,7 +134,6 @@ async def cb_accept_rules(callback: CallbackQuery, session: AsyncSession, state:
 
     data = await state.get_data()
     ref_token = data.get("ref_token")
-    await state.clear()
 
     referrer: User | None = None
     if ref_token:
@@ -123,6 +141,20 @@ async def cb_accept_rules(callback: CallbackQuery, session: AsyncSession, state:
         candidate = ref_result.scalar_one_or_none()
         if candidate and candidate.tg_id != tg_id:
             referrer = candidate
+
+    # Пришёл по реферальной ссылке — не принимаем до подписки на канал.
+    if referrer is not None:
+        sub = await _check_subscription(callback.bot, tg_id)
+        if sub is False:
+            await callback.message.edit_text(
+                "Ты перешёл по приглашению. Чтобы участвовать, "
+                "сначала подпишись на канал, затем нажми «Проверить подписку».",
+                reply_markup=get_check_subscription_keyboard(),
+            )
+            await callback.answer("Сначала подпишись на канал", show_alert=True)
+            return
+
+    await state.clear()
 
     new_user = User(
         tg_id=tg_id,

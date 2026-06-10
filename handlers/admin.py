@@ -650,11 +650,33 @@ async def cb_export_rating(callback: CallbackQuery, session: AsyncSession) -> No
     result = await session.execute(select(User).order_by(User.points.desc()))
     users = result.scalars().all()
 
+    users_by_id = {u.id: u for u in users}
+    invited_counts: dict[int, int] = defaultdict(int)
+    for u in users:
+        if u.referred_by is not None:
+            invited_counts[u.referred_by] += 1
+
+    def _referrer_label(u: User) -> str:
+        if u.referred_by is None:
+            return ""
+        ref = users_by_id.get(u.referred_by)
+        if not ref:
+            return f"id {u.referred_by}"
+        return ref.full_name or (f"@{ref.username}" if ref.username else str(ref.tg_id))
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Место", "Имя", "Username", "TG ID", "Баллы"])
+    writer.writerow(["Место", "Имя", "Username", "TG ID", "Баллы", "Пришёл от", "Пригласил (чел.)"])
     for i, u in enumerate(users, start=1):
-        writer.writerow([i, u.full_name, u.username or "", u.tg_id, u.points])
+        writer.writerow([
+            i,
+            u.full_name,
+            u.username or "",
+            u.tg_id,
+            u.points,
+            _referrer_label(u),
+            invited_counts.get(u.id, 0),
+        ])
 
     file_bytes = buf.getvalue().encode("utf-8-sig")
     await callback.message.answer_document(
