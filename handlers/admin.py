@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -249,8 +250,17 @@ async def cb_list_matches(callback: CallbackQuery, session: AsyncSession) -> Non
     await callback.answer()
 
 
+async def _safe_send(message: Message, text: str, reply_markup=None):
+    """Отправка с защитой от 429 (flood limit)."""
+    try:
+        return await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
 @router.callback_query(F.data == "admin:list_users")
-async def cb_list_users(callback: CallbackQuery, session: AsyncSession) -> None:
+async def cb_list_users(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
 
@@ -270,7 +280,11 @@ async def cb_list_users(callback: CallbackQuery, session: AsyncSession) -> None:
     for pred, match in all_preds_result.all():
         user_preds[pred.user_id].append((pred, match))
 
-    for u in users:
+    await callback.answer()
+
+    sent_ids: list[int] = []
+    last_idx = len(users) - 1
+    for idx, u in enumerate(users):
         rows = user_preds.get(u.id, [])
 
         name = html.escape(u.full_name or u.username or str(u.tg_id))
@@ -291,12 +305,37 @@ async def cb_list_users(callback: CallbackQuery, session: AsyncSession) -> None:
             f"Баллы: {u.points} | ID: {u.tg_id}\n"
             f"{spoiler}"
         )
-        del_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        kb_rows = [[
             InlineKeyboardButton(text="🗑 Удалить пользователя", callback_data=f"admin:delete_user:{u.id}")
-        ]])
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=del_kb)
+        ]]
+        if idx == last_idx:
+            kb_rows.append([
+                InlineKeyboardButton(text="🔼 Свернуть список", callback_data="admin:collapse_users")
+            ])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
-    await callback.answer()
+        msg = await _safe_send(callback.message, text, reply_markup=kb)
+        sent_ids.append(msg.message_id)
+        await asyncio.sleep(0.05)
+
+    await state.update_data(list_user_msg_ids=sent_ids)
+
+
+@router.callback_query(F.data == "admin:collapse_users")
+async def cb_collapse_users(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    data = await state.get_data()
+    ids = data.get("list_user_msg_ids", [])
+    chat_id = callback.message.chat.id
+    for mid in ids:
+        try:
+            await callback.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+        await asyncio.sleep(0.03)
+    await state.update_data(list_user_msg_ids=[])
+    await callback.answer("Список свёрнут")
 
 
 @router.callback_query(F.data.startswith("admin:delete_user:"))
@@ -312,7 +351,8 @@ async def cb_delete_user(callback: CallbackQuery, session: AsyncSession) -> None
     name = html.escape(user.full_name or user.username or str(user.tg_id))
     await callback.message.edit_text(
         f"⚠️ Удалить пользователя <b>{name}</b> (ID: {user.tg_id})?\n"
-        f"Все его прогнозы будут удалены, баллы за приглашение — у тех, кого он привёл, останутся.",
+        f"Все его прогнозы будут удалены. Если он пришёл по приглашению — "
+        f"у пригласившего снимется 1 балл и придёт уведомление.",
         parse_mode="HTML",
         reply_markup=_confirm_keyboard(
             yes_data=f"admin:confirm_delete_user:{user_id}",
@@ -323,7 +363,7 @@ async def cb_delete_user(callback: CallbackQuery, session: AsyncSession) -> None
 
 
 @router.callback_query(F.data.startswith("admin:confirm_delete_user:"))
-async def cb_confirm_delete_user(callback: CallbackQuery, session: AsyncSession) -> None:
+async def cb_confirm_delete_user(callback: CallbackQuery, session: AsyncSession, user_bot: Bot) -> None:
     if not is_admin(callback.from_user.id):
         return
     user_id = int(callback.data.split(":")[2])
@@ -336,6 +376,14 @@ async def cb_confirm_delete_user(callback: CallbackQuery, session: AsyncSession)
     name = html.escape(user.full_name or user.username or str(user.tg_id))
     tg_id = user.tg_id
 
+    # Если пользователь пришёл по приглашению — снимаем балл у пригласившего и уведомляем его
+    referrer: User | None = None
+    if user.referred_by is not None:
+        ref_result = await session.execute(select(User).where(User.id == user.referred_by))
+        referrer = ref_result.scalar_one_or_none()
+        if referrer and referrer.points > 0:
+            referrer.points -= 1
+
     # Отвязываем приглашённых, чтобы не нарушить внешний ключ
     await session.execute(
         update(User).where(User.referred_by == user_id).values(referred_by=None)
@@ -344,8 +392,21 @@ async def cb_confirm_delete_user(callback: CallbackQuery, session: AsyncSession)
     await session.delete(user)
     await session.commit()
 
+    notice = ""
+    if referrer:
+        try:
+            await user_bot.send_message(
+                referrer.tg_id,
+                f"⚠️ Приглашённый тобой участник <b>{name}</b> удалён.\n"
+                f"С твоего счёта снят <b>1 балл</b>. Текущий счёт: <b>{referrer.points}</b>.",
+                parse_mode="HTML",
+            )
+            notice = f"\nПригласивший уведомлён, у него снят 1 балл."
+        except Exception:
+            notice = f"\nПригласившему снят 1 балл (уведомить не удалось)."
+
     await callback.message.edit_text(
-        f"🗑 Пользователь <b>{name}</b> (ID: {tg_id}) удалён.",
+        f"🗑 Пользователь <b>{name}</b> (ID: {tg_id}) удалён.{notice}",
         parse_mode="HTML",
     )
     await callback.answer()
