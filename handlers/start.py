@@ -39,7 +39,7 @@ WELCOME_TEXT = (
     "<b>Прогнозист ЧМ 2026</b>\n\n"
    "• Каждый день ты получаешь 2 задания — прогнозы на матчи\n"
     "• За правильный прогноз — <b>+1 балл</b>\n"
-    "• За приглашённого друга — <b>+2 балла</b>\n"
+    "• За приглашённого друга — <b>+1 балл</b>\n"
     "• По итогам турнира лучшие участники получат <b>приз</b>\n\n"
     "Нажми кнопку, чтобы начать!"
 )
@@ -133,7 +133,7 @@ async def cb_accept_rules(callback: CallbackQuery, session: AsyncSession, state:
     )
     session.add(new_user)
     if referrer:
-        referrer.points += 2
+        referrer.points += 1
     await session.commit()
 
     await callback.message.edit_text(

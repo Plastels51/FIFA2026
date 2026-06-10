@@ -24,7 +24,7 @@ async def build_referral_text(tg_id: int, session: AsyncSession, bot_username: s
     return (
         f"Твоя реферальная ссылка:\n<code>{link}</code>\n\n"
         f"Приглашено друзей: <b>{invited_count}</b>\n"
-        f"За каждого приглашённого ты получаешь <b>+2 балла</b>!"
+        f"За каждого приглашённого ты получаешь <b>+1 балл</b>!"
     )
 
 
