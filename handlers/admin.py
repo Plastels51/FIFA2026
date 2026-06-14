@@ -44,6 +44,13 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
 def _norm_answer(text: str) -> str:
     return (text or "").strip().casefold()
 
+
+def _answers_display(correct_answers: list[str]) -> str:
+    """Текст итога: список правильных или «другой исход», если верных нет."""
+    if correct_answers:
+        return " / ".join(correct_answers)
+    return "другой исход (ни один вариант не верен)"
+
 router = Router()
 
 
@@ -218,8 +225,8 @@ def _match_card(m: Match) -> tuple[str, InlineKeyboardMarkup]:
         f"{reception_icon} Приём прогнозов\n----------\n"
         f"Варианты:\n{opts_text}"
     )
-    if m.is_resolved and m.correct_answer:
-        text += f"\n----------\n🏁 Правильный ответ: <b>{html.escape(m.correct_answer)}</b>"
+    if m.is_resolved:
+        text += f"\n----------\n🏁 Правильный ответ: <b>{html.escape(_answers_display(m.correct_answers))}</b>"
 
     action_rows = []
     if not m.is_closed:
@@ -549,7 +556,7 @@ async def cb_cancel_to_card(callback: CallbackQuery, session: AsyncSession) -> N
     await callback.answer()
 
 
-def _resolve_keyboard(match_id: int, options: list[str], selected: set[int]) -> InlineKeyboardMarkup:
+def _resolve_keyboard(match_id: int, options: list[str], selected: set[int], other: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
             text=f"{'☑️' if idx in selected else '⬜️'} {opt}",
@@ -557,6 +564,10 @@ def _resolve_keyboard(match_id: int, options: list[str], selected: set[int]) -> 
         )]
         for idx, opt in enumerate(options)
     ]
+    rows.append([InlineKeyboardButton(
+        text=f"{'☑️' if other else '⬜️'} 🚫 Другой (ни один не верен)",
+        callback_data=f"admin:rother:{match_id}",
+    )])
     rows.append([
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin:rconfirm:{match_id}"),
         InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin:cancel_to_card:{match_id}"),
@@ -566,15 +577,15 @@ def _resolve_keyboard(match_id: int, options: list[str], selected: set[int]) -> 
 
 def _resolve_header(match: Match) -> str:
     header = f"Матч: <b>{html.escape(match.title)}</b>\n\n"
-    if match.is_resolved and match.correct_answers:
-        joined = html.escape(" / ".join(match.correct_answers))
+    if match.is_resolved:
+        cur = html.escape(_answers_display(match.correct_answers))
         header += (
-            f"Текущий правильный ответ: <b>{joined}</b>\n"
-            "Отметь правильные варианты (можно несколько) и нажми «Подтвердить». "
-            "Баллы будут пересчитаны:"
+            f"Текущий итог: <b>{cur}</b>\n"
+            "Отметь правильные варианты (можно несколько) или «Другой», "
+            "затем «Подтвердить». Баллы будут пересчитаны:"
         )
     else:
-        header += "Отметь правильные варианты (можно несколько) и нажми «Подтвердить»:"
+        header += "Отметь правильные варианты (можно несколько) или «Другой», затем «Подтвердить»:"
     return header
 
 
@@ -592,12 +603,13 @@ async def cb_resolve_match_direct(callback: CallbackQuery, session: AsyncSession
     options = match.options
     current = {_norm_answer(c) for c in match.correct_answers}
     selected = {idx for idx, opt in enumerate(options) if _norm_answer(opt) in current}
-    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected))
+    other = match.is_resolved and not match.correct_answers
+    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected), resolve_other=other)
 
     await callback.message.edit_text(
         _resolve_header(match),
         parse_mode="HTML",
-        reply_markup=_resolve_keyboard(match_id, options, selected),
+        reply_markup=_resolve_keyboard(match_id, options, selected, other),
     )
     await callback.answer()
 
@@ -628,10 +640,34 @@ async def cb_resolve_toggle(callback: CallbackQuery, session: AsyncSession, stat
     data = await state.get_data()
     selected = set(data.get("resolve_selected", []))
     selected.discard(idx) if idx in selected else selected.add(idx)
-    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected))
+    # Выбор конкретного варианта снимает отметку «Другой».
+    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected), resolve_other=False)
 
     await callback.message.edit_reply_markup(
-        reply_markup=_resolve_keyboard(match_id, options, selected)
+        reply_markup=_resolve_keyboard(match_id, options, selected, other=False)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:rother:"))
+async def cb_resolve_other(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    match_id = int(callback.data.split(":")[2])
+    result = await session.execute(select(Match).where(Match.id == match_id))
+    match = result.scalar_one_or_none()
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    other = not data.get("resolve_other", False)
+    # «Другой» взаимоисключающий с конкретными вариантами.
+    selected: set[int] = set() if other else set(data.get("resolve_selected", []))
+    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected), resolve_other=other)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=_resolve_keyboard(match_id, match.options, selected, other)
     )
     await callback.answer()
 
@@ -650,12 +686,13 @@ async def cb_resolve_confirm(callback: CallbackQuery, session: AsyncSession, sta
 
     options = match.options
     data = await state.get_data()
+    other = data.get("resolve_other", False)
     selected = {i for i in data.get("resolve_selected", []) if 0 <= i < len(options)}
-    if not selected:
-        await callback.answer("Отметь хотя бы один правильный вариант.", show_alert=True)
+    if not other and not selected:
+        await callback.answer("Отметь варианты или выбери «Другой».", show_alert=True)
         return
 
-    correct_list = [options[i] for i in sorted(selected)]
+    correct_list = [] if other else [options[i] for i in sorted(selected)]
     correct_norm_set = {_norm_answer(c) for c in correct_list}
     is_recount = match.is_resolved
 
@@ -696,9 +733,9 @@ async def cb_resolve_confirm(callback: CallbackQuery, session: AsyncSession, sta
     match.is_resolved = True
 
     await session.commit()
-    await state.update_data(resolve_match_id=None, resolve_selected=[])
+    await state.update_data(resolve_match_id=None, resolve_selected=[], resolve_other=False)
 
-    safe_correct = html.escape(" / ".join(correct_list))
+    safe_correct = html.escape(_answers_display(correct_list))
     safe_title = html.escape(match.title)
     verb = "пересчитан" if is_recount else "сохранён"
     await callback.message.edit_text(
@@ -716,8 +753,10 @@ async def cb_resolve_confirm(callback: CallbackQuery, session: AsyncSession, sta
             continue
         if pred.is_correct:
             text = f"Матч <b>{safe_title}</b> завершён!\nТвой прогноз верный — <b>+1 балл</b>! Текущий счёт: {user.points}"
-        else:
+        elif correct_list:
             text = f"Матч <b>{safe_title}</b> завершён.\nК сожалению, твой прогноз не совпал. Правильный ответ: <b>{safe_correct}</b>"
+        else:
+            text = f"Матч <b>{safe_title}</b> завершён.\nНи один из предложенных вариантов не оказался верным."
         await safe_send(user_bot, user.tg_id, text, parse_mode="HTML")
         await asyncio.sleep(SEND_DELAY)
 
@@ -868,7 +907,7 @@ async def cb_export_predictions(callback: CallbackQuery, session: AsyncSession) 
             m.title,
             m.match_time.strftime("%d.%m.%Y %H:%M"),
             pred.answer,
-            m.correct_answer or "",
+            m.correct_answer or ("другой исход" if m.is_resolved else ""),
             verdict,
             "Да" if m.is_resolved else "Нет",
         ])
