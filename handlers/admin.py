@@ -549,8 +549,37 @@ async def cb_cancel_to_card(callback: CallbackQuery, session: AsyncSession) -> N
     await callback.answer()
 
 
+def _resolve_keyboard(match_id: int, options: list[str], selected: set[int]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'☑️' if idx in selected else '⬜️'} {opt}",
+            callback_data=f"admin:rtoggle:{match_id}:{idx}",
+        )]
+        for idx, opt in enumerate(options)
+    ]
+    rows.append([
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin:rconfirm:{match_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin:cancel_to_card:{match_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _resolve_header(match: Match) -> str:
+    header = f"Матч: <b>{html.escape(match.title)}</b>\n\n"
+    if match.is_resolved and match.correct_answers:
+        joined = html.escape(" / ".join(match.correct_answers))
+        header += (
+            f"Текущий правильный ответ: <b>{joined}</b>\n"
+            "Отметь правильные варианты (можно несколько) и нажми «Подтвердить». "
+            "Баллы будут пересчитаны:"
+        )
+    else:
+        header += "Отметь правильные варианты (можно несколько) и нажми «Подтвердить»:"
+    return header
+
+
 @router.callback_query(F.data.startswith("admin:resolve_match_id:"))
-async def cb_resolve_match_direct(callback: CallbackQuery, session: AsyncSession) -> None:
+async def cb_resolve_match_direct(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
     match_id = int(callback.data.split(":")[2])
@@ -560,29 +589,21 @@ async def cb_resolve_match_direct(callback: CallbackQuery, session: AsyncSession
         await callback.answer("Матч не найден.", show_alert=True)
         return
 
-    buttons = [
-        [InlineKeyboardButton(text=opt, callback_data=f"admin:pick_correct:{match_id}:{idx}")]
-        for idx, opt in enumerate(match.options)
-    ]
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin:cancel_to_card:{match_id}")])
-    header = f"Матч: <b>{html.escape(match.title)}</b>\n\n"
-    if match.is_resolved and match.correct_answer:
-        header += (
-            f"Текущий правильный ответ: <b>{html.escape(match.correct_answer)}</b>\n"
-            "Выбери новый правильный вариант (баллы будут пересчитаны):"
-        )
-    else:
-        header += "Выбери правильный вариант:"
+    options = match.options
+    current = {_norm_answer(c) for c in match.correct_answers}
+    selected = {idx for idx, opt in enumerate(options) if _norm_answer(opt) in current}
+    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected))
+
     await callback.message.edit_text(
-        header,
+        _resolve_header(match),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        reply_markup=_resolve_keyboard(match_id, options, selected),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("admin:pick_correct:"))
-async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_bot: Bot) -> None:
+@router.callback_query(F.data.startswith("admin:rtoggle:"))
+async def cb_resolve_toggle(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
     try:
@@ -603,7 +624,39 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
     if idx < 0 or idx >= len(options):
         await callback.answer("Вариант не найден.", show_alert=True)
         return
-    correct = options[idx]
+
+    data = await state.get_data()
+    selected = set(data.get("resolve_selected", []))
+    selected.discard(idx) if idx in selected else selected.add(idx)
+    await state.update_data(resolve_match_id=match_id, resolve_selected=sorted(selected))
+
+    await callback.message.edit_reply_markup(
+        reply_markup=_resolve_keyboard(match_id, options, selected)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:rconfirm:"))
+async def cb_resolve_confirm(callback: CallbackQuery, session: AsyncSession, state: FSMContext, user_bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    match_id = int(callback.data.split(":")[2])
+
+    result = await session.execute(select(Match).where(Match.id == match_id))
+    match = result.scalar_one_or_none()
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+
+    options = match.options
+    data = await state.get_data()
+    selected = {i for i in data.get("resolve_selected", []) if 0 <= i < len(options)}
+    if not selected:
+        await callback.answer("Отметь хотя бы один правильный вариант.", show_alert=True)
+        return
+
+    correct_list = [options[i] for i in sorted(selected)]
+    correct_norm_set = {_norm_answer(c) for c in correct_list}
     is_recount = match.is_resolved
 
     preds_result = await session.execute(
@@ -619,7 +672,6 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
     else:
         users_by_id = {}
 
-    correct_norm = _norm_answer(correct)
     correct_count = 0
     notify: list[Prediction] = []
     for pred in predictions:
@@ -629,7 +681,7 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
         if prev_correct is True and user:
             user.points -= 1
 
-        new_correct = _norm_answer(pred.answer) == correct_norm
+        new_correct = _norm_answer(pred.answer) in correct_norm_set
         pred.is_correct = new_correct
         if new_correct and user:
             user.points += 1
@@ -639,12 +691,14 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
         if not is_recount or prev_correct != new_correct:
             notify.append(pred)
 
-    match.correct_answer = correct
+    match.correct_answers = correct_list
     match.is_closed = True
     match.is_resolved = True
 
     await session.commit()
-    safe_correct = html.escape(correct)
+    await state.update_data(resolve_match_id=None, resolve_selected=[])
+
+    safe_correct = html.escape(" / ".join(correct_list))
     safe_title = html.escape(match.title)
     verb = "пересчитан" if is_recount else "сохранён"
     await callback.message.edit_text(

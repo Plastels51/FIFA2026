@@ -30,6 +30,11 @@ async def init_db(retries: int = 5, delay: float = 0.5) -> None:
             async with engine.begin() as conn:
                 await conn.execute(text("PRAGMA journal_mode=WAL"))
                 await conn.run_sync(Base.metadata.create_all)
+                # Идемпотентно добавляем колонку для нескольких правильных ответов.
+                info = await conn.execute(text("PRAGMA table_info(matches)"))
+                columns = {row[1] for row in info}
+                if "correct_answers" not in columns:
+                    await conn.execute(text("ALTER TABLE matches ADD COLUMN correct_answers TEXT"))
             return
         except OperationalError as e:
             last_err = e
