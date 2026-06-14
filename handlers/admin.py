@@ -18,7 +18,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
 )
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,7 +37,12 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🏁 Итоги", callback_data="admin:results")],
         [InlineKeyboardButton(text="📊 Экспорт рейтинга", callback_data="admin:export_rating")],
+        [InlineKeyboardButton(text="🧾 Экспорт прогнозов", callback_data="admin:export_predictions")],
     ])
+
+
+def _norm_answer(text: str) -> str:
+    return (text or "").strip().casefold()
 
 router = Router()
 
@@ -605,9 +610,10 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
     else:
         users_by_id = {}
 
+    correct_norm = _norm_answer(correct)
     correct_count = 0
     for pred in predictions:
-        pred.is_correct = pred.answer == correct
+        pred.is_correct = _norm_answer(pred.answer) == correct_norm
         user = users_by_id.get(pred.user_id)
         if pred.is_correct and user:
             user.points += 1
@@ -747,6 +753,54 @@ async def cb_export_rating(callback: CallbackQuery, session: AsyncSession) -> No
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:export_predictions")
+async def cb_export_predictions(callback: CallbackQuery, session: AsyncSession) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    result = await session.execute(
+        select(Prediction, User, Match)
+        .join(User, Prediction.user_id == User.id)
+        .join(Match, Prediction.match_id == Match.id)
+        .order_by(Match.match_time.desc(), User.full_name)
+    )
+    rows = result.all()
+    if not rows:
+        await callback.answer("Прогнозов нет.", show_alert=True)
+        return
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "Имя", "Username", "TG ID", "Матч", "Время матча",
+        "Прогноз", "Правильный ответ", "Засчитан", "Матч завершён",
+    ])
+    for pred, u, m in rows:
+        if pred.is_correct is True:
+            verdict = "Да"
+        elif pred.is_correct is False:
+            verdict = "Нет"
+        else:
+            verdict = "—"
+        writer.writerow([
+            u.full_name,
+            u.username or "",
+            u.tg_id,
+            m.title,
+            m.match_time.strftime("%d.%m.%Y %H:%M"),
+            pred.answer,
+            m.correct_answer or "",
+            verdict,
+            "Да" if m.is_resolved else "Нет",
+        ])
+
+    file_bytes = buf.getvalue().encode("utf-8-sig")
+    await callback.message.answer_document(
+        BufferedInputFile(file_bytes, filename="predictions.csv"),
+        caption=f"Все прогнозы участников ({len(rows)})",
+    )
+    await callback.answer()
+
+
 # ── Редактирование матча ──────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("admin:edit_match:"))
@@ -826,15 +880,42 @@ async def fsm_edit_match_time(message: Message, state: FSMContext, session: Asyn
 
 # ── Редактирование вариантов ──────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("admin:edit_options:"))
-async def cb_edit_options(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        return
-    match_id = int(callback.data.split(":")[2])
+async def _start_edit_options(callback: CallbackQuery, state: FSMContext, match_id: int) -> None:
     await state.update_data(match_id=match_id, options=[])
     await callback.message.answer("Введи новые варианты по одному.\nВариант 1:")
     await state.set_state(EditOptionsFSM.option)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:edit_options:"))
+async def cb_edit_options(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    match_id = int(callback.data.split(":")[2])
+    preds_count = await session.scalar(
+        select(func.count(Prediction.id)).where(Prediction.match_id == match_id)
+    )
+    if preds_count:
+        await callback.message.edit_text(
+            f"⚠️ На этот матч уже есть прогнозы ({preds_count}).\n"
+            "Если изменить варианты, ранее сделанные прогнозы перестанут совпадать "
+            "с новым списком и могут не засчитаться при подведении итога.\n\nПродолжить?",
+            reply_markup=_confirm_keyboard(
+                yes_data=f"admin:edit_options_go:{match_id}",
+                cancel_data=f"admin:cancel_to_card:{match_id}",
+            ),
+        )
+        await callback.answer()
+        return
+    await _start_edit_options(callback, state, match_id)
+
+
+@router.callback_query(F.data.startswith("admin:edit_options_go:"))
+async def cb_edit_options_go(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    match_id = int(callback.data.split(":")[2])
+    await _start_edit_options(callback, state, match_id)
 
 
 @router.message(EditOptionsFSM.option, F.text == "Готово")
