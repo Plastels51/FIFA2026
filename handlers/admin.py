@@ -218,11 +218,15 @@ def _match_card(m: Match) -> tuple[str, InlineKeyboardMarkup]:
         f"{reception_icon} Приём прогнозов\n----------\n"
         f"Варианты:\n{opts_text}"
     )
+    if m.is_resolved and m.correct_answer:
+        text += f"\n----------\n🏁 Правильный ответ: <b>{html.escape(m.correct_answer)}</b>"
 
     action_rows = []
     if not m.is_closed:
         action_rows.append([InlineKeyboardButton(text="🔒 Закрыть приём", callback_data=f"admin:close_match_id:{m.id}")])
-    if not m.is_resolved:
+    if m.is_resolved:
+        action_rows.append([InlineKeyboardButton(text="♻️ Пересчитать итог", callback_data=f"admin:resolve_match_id:{m.id}")])
+    else:
         action_rows.append([InlineKeyboardButton(text="✅ Итоговый результат", callback_data=f"admin:resolve_match_id:{m.id}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -561,8 +565,16 @@ async def cb_resolve_match_direct(callback: CallbackQuery, session: AsyncSession
         for idx, opt in enumerate(match.options)
     ]
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin:cancel_to_card:{match_id}")])
+    header = f"Матч: <b>{html.escape(match.title)}</b>\n\n"
+    if match.is_resolved and match.correct_answer:
+        header += (
+            f"Текущий правильный ответ: <b>{html.escape(match.correct_answer)}</b>\n"
+            "Выбери новый правильный вариант (баллы будут пересчитаны):"
+        )
+    else:
+        header += "Выбери правильный вариант:"
     await callback.message.edit_text(
-        f"Матч: <b>{html.escape(match.title)}</b>\n\nВыбери правильный вариант:",
+        header,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -592,10 +604,7 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
         await callback.answer("Вариант не найден.", show_alert=True)
         return
     correct = options[idx]
-
-    match.correct_answer = correct
-    match.is_closed = True
-    match.is_resolved = True
+    is_recount = match.is_resolved
 
     preds_result = await session.execute(
         select(Prediction).where(Prediction.match_id == match_id)
@@ -612,25 +621,42 @@ async def cb_pick_correct(callback: CallbackQuery, session: AsyncSession, user_b
 
     correct_norm = _norm_answer(correct)
     correct_count = 0
+    notify: list[Prediction] = []
     for pred in predictions:
-        pred.is_correct = _norm_answer(pred.answer) == correct_norm
+        prev_correct = pred.is_correct
         user = users_by_id.get(pred.user_id)
-        if pred.is_correct and user:
+        # Снимаем ранее начисленный за этот матч балл, чтобы пересчёт был идемпотентным.
+        if prev_correct is True and user:
+            user.points -= 1
+
+        new_correct = _norm_answer(pred.answer) == correct_norm
+        pred.is_correct = new_correct
+        if new_correct and user:
             user.points += 1
             correct_count += 1
+
+        # При первом подведении уведомляем всех, при пересчёте — только изменившихся.
+        if not is_recount or prev_correct != new_correct:
+            notify.append(pred)
+
+    match.correct_answer = correct
+    match.is_closed = True
+    match.is_resolved = True
 
     await session.commit()
     safe_correct = html.escape(correct)
     safe_title = html.escape(match.title)
+    verb = "пересчитан" if is_recount else "сохранён"
     await callback.message.edit_text(
-        f"Результат матча [{match_id}] сохранён.\n"
+        f"Результат матча [{match_id}] {verb}.\n"
         f"Правильный ответ: <b>{safe_correct}</b>\n"
-        f"Угадали: {correct_count} из {len(predictions)}",
+        f"Угадали: {correct_count} из {len(predictions)}"
+        + (f"\nУведомлений отправлено: {len(notify)}" if is_recount else ""),
         parse_mode="HTML",
     )
     await callback.answer()
 
-    for pred in predictions:
+    for pred in notify:
         user = users_by_id.get(pred.user_id)
         if not user:
             continue
