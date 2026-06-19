@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import ADMIN_BOT_TOKEN, USER_BOT_TOKEN
@@ -19,6 +20,20 @@ async def db_middleware(handler, event, data):
     async with async_session_factory() as session:
         data["session"] = session
         return await handler(event, data)
+
+
+async def run_polling_with_retry(dp: Dispatcher, bot: Bot) -> None:
+    """Поллинг с переподключением при сетевых ошибках Telegram."""
+    allowed = dp.resolve_used_update_types()
+    delay = 5
+    while True:
+        try:
+            await dp.start_polling(bot, allowed_updates=allowed)
+            return
+        except TelegramNetworkError as e:
+            logging.warning("Сетевая ошибка Telegram: %s. Повтор через %d с.", e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
 
 
 async def main() -> None:
@@ -39,7 +54,7 @@ async def main() -> None:
     dp.include_router(admin.router)
 
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await run_polling_with_retry(dp, bot)
     finally:
         await bot.session.close()
         await user_bot.session.close()
